@@ -9,8 +9,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stream = es.stream().await.unwrap();
 
-    //while let Some(event) = stream.next().await {
-    for event in stream.next().await {
+    while let Some(event) = stream.next().await {
+    //for event in stream.next().await {
         let event = event.unwrap();
         match event {
             Event::Message(msg)=> {
