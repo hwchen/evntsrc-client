@@ -1,6 +1,6 @@
 use bytes::{BytesMut, BufMut};
 use futures::{Stream, StreamExt};
-use hyper::{http, Body, Client};
+use hyper::{http, Body, Client, Request};
 use hyper_tls::HttpsConnector;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -27,12 +27,20 @@ impl EventSource {
         let client = Client::builder()
             .build::<_, hyper::Body>(https);
 
-        let resource: http::Uri = self.url.parse()?;
+        let url: http::Uri = self.url.parse()?;
 
-        let resp = client.get(resource).await?;
+        let req = Request::builder()
+            .method("GET")
+            .uri(url)
+            .header("Accept", "text/event-stream")
+            .body(Body::empty())?;
+
+
+        let resp = client.request(req).await?;
 
         // TODO check that resp is `text/event-stream` content type
         // and that it's 200OK
+        // 204 No Content means don't try to reconnect
 
         let body = resp.into_body();
 
