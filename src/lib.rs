@@ -6,6 +6,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 // TODO change to Opts
+// TODO use trace
+// TODO add timeout
 pub struct EventSource {
     url: String,
     reconnection_time: u32, // in milliseconds
@@ -39,7 +41,6 @@ impl EventSource {
 
         // TODO check that resp is `text/event-stream` content type
         // and that it's 200OK
-        // 204 No Content means don't try to reconnect
 
         let body = resp.into_body();
 
@@ -85,35 +86,76 @@ impl Stream for EventStream {
                 },
                 Poll::Ready(Ok(resp)) => {
                     println!("readyok, reconnecting");
+
+                    // TODO 204 No Content means don't try to reconnect
                     *body = resp.into_body();
                     *state = State::Stream;
                 },
-
             }
         }
 
         println!("hit2");
         match body.poll_next_unpin(cx) {
-            Poll::Ready(None) => { println!("end stream"); Poll::Pending},
-            Poll::Pending => {
-                println!("pending, reconnect");
-
+            Poll::Pending => { println!("pending"); Poll::Pending },
+            Poll::Ready(None) => {
+                println!("stream ended, reconnect");
                 let req = Request::builder()
                     .method("GET")
                     .uri((*url).clone())
                     .header("Accept", "text/event-stream")
                     .body(Body::empty())?;
 
-                let resp_fut = client.request(req);
+                let mut resp_fut = client.request(req);
 
-                *state = State::Reconnect(Box::pin(resp_fut));
+                // We're still on the completed body (returned None), so have to kickstart
+                // polling a new task? Doesn't seem to work if we just pass return Poll::Pending
+                // and wait for the next round of polling.
+                //
+                // match block copied from above
+                match resp_fut.poll_unpin(cx) {
+                    Poll::Pending => {
+                        println!("pending reconnect");
+                        *state = State::Reconnect(Box::pin(resp_fut));
+                        return Poll::Pending;
+                    },
+                    Poll::Ready(Err(err)) => {
+                        println!("readyerr reconnect err: {}", err);
+                        *state = State::Reconnect(Box::pin(resp_fut));
+                        return Poll::Ready(Some(Err(format!("Could not reconnect: {}", err).into())));
+                    },
+                    Poll::Ready(Ok(resp)) => {
+                        println!("readyok, reconnecting");
 
-                Poll::Pending
+                        // TODO 204 No Content means don't try to reconnect
+                        *body = resp.into_body();
+                        *state = State::Stream;
+                        return Poll::Pending;
+                    },
+                }
             },
             Poll::Ready(Some(chunk)) => {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
-                    Err(err) => return Poll::Ready(Some(Err(err.into()))),
+                    Err(err) => {
+                        // TODO check all error cases
+                        if err.is_closed() || err.is_canceled() {
+                            println!("error, reconnect");
+
+                            let req = Request::builder()
+                                .method("GET")
+                                .uri((*url).clone())
+                                .header("Accept", "text/event-stream")
+                                .body(Body::empty())?;
+
+                            let resp_fut = client.request(req);
+
+                            *state = State::Reconnect(Box::pin(resp_fut));
+
+                            return Poll::Pending;
+                        } else {
+                            return Poll::Ready(Some(Err(err.into())));
+                        }
+                    },
                 };
 
                 buf.put(chunk.into_bytes());
@@ -127,7 +169,7 @@ impl Stream for EventStream {
                         text: String::from_utf8(message_bytes.to_vec()).unwrap(),
                     }))))
                 } else {
-                    println!("readysome, not full message");
+                    println!("readysome, not full message: {}", String::from_utf8(buf.to_vec()).unwrap());
                     Poll::Ready(None)
                 }
             }
