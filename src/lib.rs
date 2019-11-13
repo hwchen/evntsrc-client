@@ -2,7 +2,7 @@ mod events;
 mod parse;
 
 use bytes::{BytesMut, BufMut};
-use futures::{Future, FutureExt, Stream, StreamExt};
+use futures::{Future, FutureExt, ready, Stream, StreamExt};
 use hyper::{client, http, Body, Client, Request, Response};
 use hyper_tls::HttpsConnector;
 use std::pin::Pin;
@@ -17,6 +17,11 @@ pub use crate::events::Event;
 pub struct Opts {
     reconnection_delay: u64, // in milliseconds
     buffer_capacity: usize,
+}
+
+pub struct EventSource {
+    inner_streams: EventStream,
+    next_stream: Option<Vec<Event>>,
 }
 
 impl EventSource {
@@ -62,20 +67,55 @@ impl EventSource {
         let timer_handle = timer::Handle::default();
 
         Ok(EventSource {
-            client,
-            url,
-            reconnection_delay: opts.reconnection_delay,
-            last_id: "".to_owned(),
-            timer: timer_handle,
-            buf: BytesMut::with_capacity(opts.buffer_capacity),
-            body,
-            state: State::Stream,
-            event_buf: Event::default(),
+            inner_streams: EventStream {
+                client,
+                url,
+                reconnection_delay: opts.reconnection_delay,
+                last_id: "".to_owned(),
+                timer: timer_handle,
+                buf: BytesMut::with_capacity(opts.buffer_capacity),
+                body,
+                state: State::Stream,
+                event_buf: Event::default(),
+                event_queue: Vec::new(),
+            },
+            next_stream: None,
         })
     }
 }
 
-pub struct EventSource {
+// Following futures Flatten
+impl Stream for EventSource {
+    type Item = Result<Event, Box<dyn std::error::Error>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let EventSource { ref mut inner_streams, ref mut next_stream } = self.get_mut();
+        loop {
+            // iterate through stream of streams
+            if next_stream.is_none() {
+                match ready!(inner_streams.poll_next_unpin(cx)) {
+                    Some(x) => {
+                        match x {
+                            Ok(x) => *next_stream = Some(x),
+                            Err(err) => return Poll::Ready(Some(Err(err.into()))),
+                        }
+                    },
+                    None => return Poll::Ready(None),
+                }
+            }
+
+            // now iterate through the current stream
+            // TODO don't pop
+            if let Some(ev) = next_stream.as_mut().and_then(|events| events.pop()) {
+                return Poll::Ready(Some(Ok(ev)));
+            } else {
+                *next_stream = None;
+            }
+        }
+    }
+}
+
+struct EventStream {
     client: Client<HttpsConnector<client::HttpConnector>>,
     url: http::Uri,
     reconnection_delay: u64, // in milliseconds
@@ -85,13 +125,14 @@ pub struct EventSource {
     body: Body,
     state: State,
     event_buf: Event,
+    event_queue: Vec<Event>,
 }
 
-impl Stream for EventSource {
-    type Item = Result<Event, Box<dyn std::error::Error>>;
+impl Stream for EventStream {
+    type Item = Result<Vec<Event>, Box<dyn std::error::Error>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let EventSource {
+        let EventStream {
             ref mut client,
             url,
             reconnection_delay,
@@ -101,6 +142,7 @@ impl Stream for EventSource {
             ref mut body,
             ref mut state,
             ref mut event_buf,
+            ref mut event_queue,
             .. } = self.get_mut();
 
         // first handle reconnect and delay
@@ -228,52 +270,57 @@ impl Stream for EventSource {
                     let s = String::from_utf8(message_bytes.to_vec())?;
                     event!(Level::INFO, "process lines: {}", s);
 
-                    // fn process line
-                    match s.parse::<Line>() {
-                        Ok(line) => {
-                            match line {
-                                Line::Empty => {
-                                    event!(Level::DEBUG, "dispatch event: {}", s);
-                                    let dispatched_event = std::mem::take(event_buf);
-                                    return Poll::Ready(Some(Ok(dispatched_event)));
-                                },
-                                Line::Comment(s) => {
-                                    event!(Level::INFO, "comment: {}", s);
-                                    return Poll::Pending;
-                                },
-                                Line::FieldValue { field, value } => {
-                                    // fn process field
-                                    match field {
-                                        Field::Event => {
-                                            event!(Level::DEBUG, "update event type: {}", s);
-                                            event_buf.ty = value;
-                                            return Poll::Pending;
-                                        },
-                                        Field::Data => {
-                                            event!(Level::DEBUG, "update event data: {}", s);
-                                            event_buf.data = value;
-                                            return Poll::Pending;
-                                        },
-                                        Field::Id => {
-                                            event!(Level::DEBUG, "update event id: {}", s);
-                                            *last_id = value.clone();
-                                            event_buf.id = value;
-                                            return Poll::Pending;
-                                        },
-                                        Field::Retry => {
-                                            let new_delay = match value.parse::<u64>() {
-                                                Ok(t) => t,
-                                                Err(_) => return Poll::Pending,//ignore
-                                            };
-                                            *reconnection_delay = new_delay;
-                                            return Poll::Pending;
-                                        },
-                                    }
-                                },
-                            }
-                        },
+                    // fn process lines
+                    for line_str in s.lines() {
+                        event!(Level::DEBUG, "process line: {}", line_str);
+                        match line_str.parse::<Line>() {
+                            Ok(line) => {
+                                match line {
+                                    Line::Empty => {
+                                        event!(Level::DEBUG, "dispatch event: {}", line_str);
+                                        let dispatched_event = std::mem::take(event_buf);
+                                        event_queue.push(dispatched_event);
+                                    },
+                                    Line::Comment(s) => {
+                                        event!(Level::INFO, "comment: {}", line_str);
+                                    },
+                                    Line::FieldValue { field, value } => {
+                                        // fn process field
+                                        match field {
+                                            Field::Event => {
+                                                event!(Level::DEBUG, "update event type: {}", line_str);
+                                                event_buf.ty = value;
+                                            },
+                                            Field::Data => {
+                                                event!(Level::DEBUG, "update event data: {}", line_str);
+                                                event_buf.data += &value;
+                                                event_buf.data.push_str("\n");
+                                            },
+                                            Field::Id => {
+                                                event!(Level::DEBUG, "update event id: {}", line_str);
+                                                *last_id = value.clone();
+                                                event_buf.id = value;
+                                            },
+                                            Field::Retry => {
+                                                let new_delay = match value.parse::<u64>() {
+                                                    Ok(t) => t,
+                                                    Err(_) => return Poll::Pending,//ignore
+                                                };
+                                                *reconnection_delay = new_delay;
+                                            },
+                                        }
+                                    },
+                                }
+                            },
 
-                        Err(err) => Poll::Ready(Some(Err(err.into()))),
+                            Err(err) => return Poll::Ready(Some(Err(err.into()))),
+                        }
+                    }
+                    if !event_queue.is_empty() {
+                        let dispatch = std::mem::take(event_queue);
+                        Poll::Ready(Some(Ok(dispatch)))
+                    } else {
+                        Poll::Pending
                     }
                 } else {
                     event!(Level::DEBUG, "readysome, not full message: {}", String::from_utf8(buf.to_vec()).unwrap());
