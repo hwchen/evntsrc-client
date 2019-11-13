@@ -1,6 +1,6 @@
 use bytes::{BytesMut, BufMut};
-use futures::{FutureExt, Stream, StreamExt};
-use hyper::{client, http, Body, Client, Request};
+use futures::{Future, FutureExt, Stream, StreamExt};
+use hyper::{client, http, Body, Client, Request, Response};
 use hyper_tls::HttpsConnector;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -50,6 +50,7 @@ impl EventSource {
             last_event_id_string: "".to_owned(),
             buf: BytesMut::with_capacity(1_000_000),
             body,
+            state: State::Stream,
         })
     }
 }
@@ -61,18 +62,41 @@ pub struct EventStream {
     last_event_id_string: String,
     buf: BytesMut,
     body: Body,
+    state: State,
 }
 
 impl Stream for EventStream {
     type Item = Result<Event, Box<dyn std::error::Error>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let EventStream{ ref mut body, ref mut buf, ref mut client, url, .. }  = self.get_mut();
+        println!("hit");
+        let EventStream { ref mut body, ref mut buf, ref mut client, url, ref mut state, .. } = self.get_mut();
 
+        // early return for handling reconnect
+        if let State::Reconnect(ref mut resp_fut) = state {
+            match resp_fut.poll_unpin(cx) {
+                Poll::Pending => {
+                    println!("pending reconnect");
+                    return Poll::Pending;
+                },
+                Poll::Ready(Err(err)) => {
+                    println!("readyerr reconnect err: {}", err);
+                    return Poll::Ready(Some(Err(format!("Could not reconnect: {}", err).into())));
+                },
+                Poll::Ready(Ok(resp)) => {
+                    println!("readyok, reconnecting");
+                    *body = resp.into_body();
+                    *state = State::Stream;
+                },
+
+            }
+        }
+
+        println!("hit2");
         match body.poll_next_unpin(cx) {
-            Poll::Pending => { println!("pending"); Poll::Pending},
-            Poll::Ready(None) => {
-                println!("readynone, reconnect");
+            Poll::Ready(None) => { println!("end stream"); Poll::Pending},
+            Poll::Pending => {
+                println!("pending, reconnect");
 
                 let req = Request::builder()
                     .method("GET")
@@ -80,28 +104,9 @@ impl Stream for EventStream {
                     .header("Accept", "text/event-stream")
                     .body(Body::empty())?;
 
+                let resp_fut = client.request(req);
 
-                // how to deal with await here? manually poll?
-                let mut resp_fut = client.request(req);
-
-                // TODO will this loop block?
-                loop {
-                    match resp_fut.poll_unpin(cx) {
-                        Poll::Pending => {
-                            //println!("pending reconnect");
-                            continue;
-                        },
-                        Poll::Ready(Err(err)) => {
-                            println!("readyerr reconnect err: {}", err);
-                            return Poll::Ready(Some(Err(format!("Could not reconnect: {}", err).into())));
-                        },
-                        Poll::Ready(Ok(resp)) => {
-                            println!("readyok, reconnecting");
-                            *body = resp.into_body();
-                            break;
-                        },
-                    }
-                }
+                *state = State::Reconnect(Box::pin(resp_fut));
 
                 Poll::Pending
             },
@@ -128,6 +133,11 @@ impl Stream for EventStream {
             }
         }
     }
+}
+
+enum State {
+    Stream,
+    Reconnect(Pin<Box<dyn Future<Output=Result<Response<Body>, hyper::error::Error>>>>),
 }
 
 pub enum Event {
