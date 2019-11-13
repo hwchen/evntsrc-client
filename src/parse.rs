@@ -1,20 +1,23 @@
-pub enum Event {
-    Message {
-        ty: String,
-        text: String,
-    },
+pub enum Line {
+    Empty,
     Comment(String),
+    FieldValue {
+        field: Field,
+        value: String, // empty string if line has no "value"
+    },
 }
 
-impl std::str::FromStr for Event {
+impl std::str::FromStr for Line {
     type Err = Box<dyn std::error::Error>;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        
         Ok(Self::Comment(s.into()))
     }
 }
 
-enum Field {
+pub enum Field {
     Event,
     Data,
     Id,

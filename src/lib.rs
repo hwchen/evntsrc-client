@@ -1,3 +1,4 @@
+mod events;
 mod parse;
 
 use bytes::{BytesMut, BufMut};
@@ -9,7 +10,8 @@ use std::task::{Context, Poll};
 use tokio_timer::timer;
 use tracing::{event, Level};
 
-pub use crate::parse::Event;
+use crate::parse::{Line, Field};
+pub use crate::events::Event;
 
 // TODO add timeout
 pub struct Opts {
@@ -51,17 +53,24 @@ impl EventSource {
 
         // This uses the default timer associated with the tokio runtime.
         // We don't have to manually set up a timer.
+        //
+        // https://github.com/tokio-rs/tokio/issues/1466#issuecomment-522300040
+        // and then read `Handle` documentation to understand that a default handle
+        // will reference whatever timer is available.
+        // I spent a lot of hours figuring this out :sweat:, along with the polling.
+        // The docs are not super clear, and there's not really many examples.
         let timer_handle = timer::Handle::default();
 
         Ok(EventSource {
             client,
             url,
             reconnection_delay: opts.reconnection_delay,
-            last_event_id_string: "".to_owned(),
+            last_id: "".to_owned(),
             timer: timer_handle,
             buf: BytesMut::with_capacity(opts.buffer_capacity),
             body,
             state: State::Stream,
+            event_buf: Event::default(),
         })
     }
 }
@@ -70,11 +79,12 @@ pub struct EventSource {
     client: Client<HttpsConnector<client::HttpConnector>>,
     url: http::Uri,
     reconnection_delay: u64, // in milliseconds
-    last_event_id_string: String,
+    last_id: String,
     timer: timer::Handle,
     buf: BytesMut,
     body: Body,
     state: State,
+    event_buf: Event,
 }
 
 impl Stream for EventSource {
@@ -85,10 +95,12 @@ impl Stream for EventSource {
             ref mut client,
             url,
             reconnection_delay,
+            ref mut last_id,
             timer,
             ref mut buf,
             ref mut body,
             ref mut state,
+            ref mut event_buf,
             .. } = self.get_mut();
 
         // first handle reconnect and delay
@@ -209,13 +221,59 @@ impl Stream for EventSource {
 
                 buf.put(chunk.into_bytes());
 
-                if let Some(idx) = buf.iter().rev().position(|byte| *byte == '\r' as u8 || *byte == '\n' as u8) {
-                    let buf_len = buf.len();
-                    let message_bytes = buf.split_to(buf_len - idx + 1);
-                    event!(Level::DEBUG, "readysome, full message. idx: {}", idx);
+                // note: whitespace trimmed when parsing line
+                if let Some(idx) = buf.iter().position(|byte| *byte == '\r' as u8 || *byte == '\n' as u8) {
+                    let message_bytes = buf.split_to(idx + 1);
+                    event!(Level::DEBUG, "readysome, full line. idx: {}", idx);
+
                     let s = String::from_utf8(message_bytes.to_vec())?;
-                    match s.parse::<Event>() {
-                        Ok(event) => Poll::Ready(Some(Ok(event))),
+                    event!(Level::INFO, "process line: {}", s);
+
+                    // fn process line
+                    match s.parse::<Line>() {
+                        Ok(line) => {
+                            match line {
+                                Line::Empty => {
+                                    event!(Level::DEBUG, "dispatch event: {}", s);
+                                    let dispatched_event = std::mem::take(event_buf);
+                                    return Poll::Ready(Some(Ok(dispatched_event)));
+                                },
+                                Line::Comment(s) => {
+                                    event!(Level::INFO, "comment: {}", s);
+                                    return Poll::Pending;
+                                },
+                                Line::FieldValue { field, value } => {
+                                    // fn process field
+                                    match field {
+                                        Field::Event => {
+                                            event!(Level::DEBUG, "update event type: {}", s);
+                                            event_buf.ty = value;
+                                            return Poll::Pending;
+                                        },
+                                        Field::Data => {
+                                            event!(Level::DEBUG, "update event data: {}", s);
+                                            event_buf.data = value;
+                                            return Poll::Pending;
+                                        },
+                                        Field::Id => {
+                                            event!(Level::DEBUG, "update event id: {}", s);
+                                            *last_id = value.clone();
+                                            event_buf.id = value;
+                                            return Poll::Pending;
+                                        },
+                                        Field::Retry => {
+                                            let new_delay = match value.parse::<u64>() {
+                                                Ok(t) => t,
+                                                Err(_) => return Poll::Pending,//ignore
+                                            };
+                                            *reconnection_delay = new_delay;
+                                            return Poll::Pending;
+                                        },
+                                    }
+                                },
+                            }
+                        },
+
                         Err(err) => Poll::Ready(Some(Err(err.into()))),
                     }
                 } else {
