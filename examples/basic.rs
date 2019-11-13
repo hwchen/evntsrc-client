@@ -12,9 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(event) = ev.next().await {
         let event = event?;
-        println!("type: {}", event.ty);
-        println!("data: {}", event.data);
-        println!("id: {}", event.id);
+        println!("event: {:#?}", event);
     };
 
     Ok(())

@@ -12,16 +12,17 @@ use tracing::{event, Level};
 
 use crate::parse::{Line, Field};
 pub use crate::events::Event;
+use crate::events::EventBuf;
 
-// TODO add timeout
+// TODO add tests
 pub struct Opts {
     reconnection_delay: u64, // in milliseconds
     buffer_capacity: usize,
 }
 
 pub struct EventSource {
-    inner_streams: EventStream,
-    next_stream: Option<Vec<Event>>,
+    inner_streams: EventBufStream,
+    next_stream: Option<Vec<EventBuf>>,
 }
 
 impl EventSource {
@@ -67,7 +68,7 @@ impl EventSource {
         let timer_handle = timer::Handle::default();
 
         Ok(EventSource {
-            inner_streams: EventStream {
+            inner_streams: EventBufStream {
                 client,
                 url,
                 reconnection_delay: opts.reconnection_delay,
@@ -76,7 +77,7 @@ impl EventSource {
                 buf: BytesMut::with_capacity(opts.buffer_capacity),
                 body,
                 state: State::Stream,
-                event_buf: Event::default(),
+                event_buf: EventBuf::default(),
                 event_queue: Vec::new(),
             },
             next_stream: None,
@@ -106,7 +107,20 @@ impl Stream for EventSource {
 
             // now iterate through the current stream
             // TODO don't pop
-            if let Some(ev) = next_stream.as_mut().and_then(|events| events.pop()) {
+            if let Some(event_buf) = next_stream.as_mut().and_then(|events| events.pop()) {
+                // dispatch section (although last_id is partially dealt with
+                // earlier
+                if event_buf.data.is_empty() {
+                    return Poll::Pending;
+                }
+
+                let ev = Event {
+                    ty: event_buf.ty.unwrap_or("message".to_owned()),
+                    data: event_buf.data.join("\n"),
+                    origin: inner_streams.url.to_string(),
+                    last_event_id: event_buf.last_event_id,
+                };
+
                 return Poll::Ready(Some(Ok(ev)));
             } else {
                 *next_stream = None;
@@ -115,7 +129,7 @@ impl Stream for EventSource {
     }
 }
 
-struct EventStream {
+struct EventBufStream {
     client: Client<HttpsConnector<client::HttpConnector>>,
     url: http::Uri,
     reconnection_delay: u64, // in milliseconds
@@ -124,15 +138,15 @@ struct EventStream {
     buf: BytesMut,
     body: Body,
     state: State,
-    event_buf: Event,
-    event_queue: Vec<Event>,
+    event_buf: EventBuf,
+    event_queue: Vec<EventBuf>,
 }
 
-impl Stream for EventStream {
-    type Item = Result<Vec<Event>, Box<dyn std::error::Error>>;
+impl Stream for EventBufStream {
+    type Item = Result<Vec<EventBuf>, Box<dyn std::error::Error>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let EventStream {
+        let EventBufStream {
             ref mut client,
             url,
             reconnection_delay,
@@ -282,24 +296,26 @@ impl Stream for EventStream {
                                         event_queue.push(dispatched_event);
                                     },
                                     Line::Comment(s) => {
-                                        event!(Level::INFO, "comment: {}", line_str);
+                                        event!(Level::INFO, "comment: {}", s);
                                     },
                                     Line::FieldValue { field, value } => {
                                         // fn process field
                                         match field {
                                             Field::Event => {
                                                 event!(Level::DEBUG, "update event type: {}", line_str);
-                                                event_buf.ty = value;
+                                                event_buf.ty = Some(value);
                                             },
                                             Field::Data => {
                                                 event!(Level::DEBUG, "update event data: {}", line_str);
-                                                event_buf.data += &value;
-                                                event_buf.data.push_str("\n");
+                                                event_buf.data.push(value);
                                             },
                                             Field::Id => {
                                                 event!(Level::DEBUG, "update event id: {}", line_str);
                                                 *last_id = value.clone();
-                                                event_buf.id = value;
+
+                                                // have to do the last_id part of dispatch here,
+                                                // otherwise the chunking will muck it up.
+                                                event_buf.last_event_id = value;
                                             },
                                             Field::Retry => {
                                                 let new_delay = match value.parse::<u64>() {
