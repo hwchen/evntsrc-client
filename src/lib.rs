@@ -1,11 +1,15 @@
+mod parse;
+
 use bytes::{BytesMut, BufMut};
 use futures::{Future, FutureExt, Stream, StreamExt};
 use hyper::{client, http, Body, Client, Request, Response};
 use hyper_tls::HttpsConnector;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio_timer::{timer, Timer};
+use tokio_timer::timer;
 use tracing::{event, Level};
+
+pub use crate::parse::Event;
 
 // TODO add timeout
 pub struct Opts {
@@ -209,10 +213,11 @@ impl Stream for EventSource {
                     let buf_len = buf.len();
                     let message_bytes = buf.split_to(buf_len - idx + 1);
                     event!(Level::DEBUG, "readysome, full message. idx: {}", idx);
-                    Poll::Ready(Some(Ok(Event::Message(Message{
-                        ty: "message".into(),
-                        text: String::from_utf8(message_bytes.to_vec()).unwrap(),
-                    }))))
+                    let s = String::from_utf8(message_bytes.to_vec())?;
+                    match s.parse::<Event>() {
+                        Ok(event) => Poll::Ready(Some(Ok(event))),
+                        Err(err) => Poll::Ready(Some(Err(err.into()))),
+                    }
                 } else {
                     event!(Level::DEBUG, "readysome, not full message: {}", String::from_utf8(buf.to_vec()).unwrap());
                     Poll::Ready(None)
@@ -228,30 +233,3 @@ enum State {
     Delay(Pin<Box<dyn Future<Output=()>>>),
 }
 
-pub enum Event {
-    Message(Message),
-    Comment,
-}
-
-pub struct Message {
-    pub ty: String,
-    pub text: String,
-}
-
-
-// parse
-
-enum Field {
-    Event,
-    Data,
-    Id,
-    Retry,
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}

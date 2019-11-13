@@ -8,17 +8,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // logging
     tracing_subscriber::fmt::init();
 
-    let mut es = EventSource::new(&url).await?;
+    let mut ev = EventSource::new(&url).await?;
 
-    while let Some(event) = es.next().await {
+    while let Some(event) = ev.next().await {
         let event = event?;
 
         match event {
-            Event::Message(msg)=> {
-                println!("type: {}", msg.ty);
-                println!("text: {}", msg.text);
+            Event::Message { ty, text } => {
+                println!("type: {}", ty);
+                println!("text: {}", text);
             },
-            _ => println!("only messages supported"),
+            Event::Comment(s) => println!("comment: {}", s),
         }
     };
 
