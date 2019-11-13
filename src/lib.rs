@@ -6,30 +6,29 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tracing::{event, Level};
 
-// TODO change to Opts
-// TODO use trace
 // TODO add timeout
-pub struct EventSource {
-    url: String,
+pub struct Opts {
     reconnection_time: u32, // in milliseconds
-    last_event_id_string: String,
+    buffer_capacity: usize,
 }
 
 impl EventSource {
-    pub fn new(url: String) -> Self {
-        EventSource {
-            url,
-            reconnection_time: 0,
-            last_event_id_string: "".to_owned(),
-        }
+    pub async fn new(url: &str) -> Result<EventSource, Box<dyn std::error::Error>> {
+        // defaults
+        let opts = Opts {
+            reconnection_time: 1000,
+            buffer_capacity: 1_000_000,
+        };
+
+        Self::new_with_opts(url, &opts).await
     }
 
-    pub async fn stream(self) -> Result<EventStream, Box<dyn std::error::Error>> {
+    pub async fn new_with_opts(url: &str, opts: &Opts) -> Result<EventSource, Box<dyn std::error::Error>> {
         let https = HttpsConnector::new()?;
         let client = Client::builder()
             .build::<_, hyper::Body>(https);
 
-        let url: http::Uri = self.url.parse()?;
+        let url: http::Uri = url.parse()?;
 
         let req = Request::builder()
             .method("GET")
@@ -45,19 +44,19 @@ impl EventSource {
 
         let body = resp.into_body();
 
-        Ok(EventStream {
+        Ok(EventSource {
             client,
             url,
-            reconnection_time: 0,
+            reconnection_time: opts.reconnection_time,
             last_event_id_string: "".to_owned(),
-            buf: BytesMut::with_capacity(1_000_000),
+            buf: BytesMut::with_capacity(opts.buffer_capacity),
             body,
             state: State::Stream,
         })
     }
 }
 
-pub struct EventStream {
+pub struct EventSource {
     client: Client<HttpsConnector<client::HttpConnector>>,
     url: http::Uri,
     reconnection_time: u32, // in milliseconds
@@ -67,11 +66,11 @@ pub struct EventStream {
     state: State,
 }
 
-impl Stream for EventStream {
+impl Stream for EventSource {
     type Item = Result<Event, Box<dyn std::error::Error>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let EventStream { ref mut body, ref mut buf, ref mut client, url, ref mut state, .. } = self.get_mut();
+        let EventSource { ref mut body, ref mut buf, ref mut client, url, ref mut state, .. } = self.get_mut();
 
         // early return for handling reconnect
         if let State::Reconnect(ref mut resp_fut) = state {
