@@ -4,6 +4,7 @@ use hyper::{client, http, Body, Client, Request, Response};
 use hyper_tls::HttpsConnector;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tracing::{event, Level};
 
 // TODO change to Opts
 // TODO use trace
@@ -70,22 +71,21 @@ impl Stream for EventStream {
     type Item = Result<Event, Box<dyn std::error::Error>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        println!("hit");
         let EventStream { ref mut body, ref mut buf, ref mut client, url, ref mut state, .. } = self.get_mut();
 
         // early return for handling reconnect
         if let State::Reconnect(ref mut resp_fut) = state {
             match resp_fut.poll_unpin(cx) {
                 Poll::Pending => {
-                    println!("pending reconnect");
+                    event!(Level::DEBUG, "pending reconnect");
                     return Poll::Pending;
                 },
                 Poll::Ready(Err(err)) => {
-                    println!("readyerr reconnect err: {}", err);
+                    event!(Level::DEBUG, "readyerr reconnect err: {}", err);
                     return Poll::Ready(Some(Err(format!("Could not reconnect: {}", err).into())));
                 },
                 Poll::Ready(Ok(resp)) => {
-                    println!("readyok, reconnecting");
+                    event!(Level::DEBUG, "readyok, reconnecting");
 
                     // TODO 204 No Content means don't try to reconnect
                     *body = resp.into_body();
@@ -94,11 +94,10 @@ impl Stream for EventStream {
             }
         }
 
-        println!("hit2");
         match body.poll_next_unpin(cx) {
-            Poll::Pending => { println!("pending"); Poll::Pending },
+            Poll::Pending => { event!(Level::DEBUG, "pending"); Poll::Pending },
             Poll::Ready(None) => {
-                println!("stream ended, reconnect");
+                event!(Level::DEBUG, "stream ended, reconnect");
                 let req = Request::builder()
                     .method("GET")
                     .uri((*url).clone())
@@ -114,17 +113,17 @@ impl Stream for EventStream {
                 // match block copied from above
                 match resp_fut.poll_unpin(cx) {
                     Poll::Pending => {
-                        println!("pending reconnect");
+                        event!(Level::DEBUG, "pending reconnect");
                         *state = State::Reconnect(Box::pin(resp_fut));
                         return Poll::Pending;
                     },
                     Poll::Ready(Err(err)) => {
-                        println!("readyerr reconnect err: {}", err);
+                        event!(Level::DEBUG, "readyerr reconnect err: {}", err);
                         *state = State::Reconnect(Box::pin(resp_fut));
                         return Poll::Ready(Some(Err(format!("Could not reconnect: {}", err).into())));
                     },
                     Poll::Ready(Ok(resp)) => {
-                        println!("readyok, reconnecting");
+                        event!(Level::DEBUG, "readyok, reconnecting");
 
                         // TODO 204 No Content means don't try to reconnect
                         *body = resp.into_body();
@@ -139,7 +138,7 @@ impl Stream for EventStream {
                     Err(err) => {
                         // TODO check all error cases
                         if err.is_closed() || err.is_canceled() {
-                            println!("error, reconnect");
+                            event!(Level::DEBUG, "error, reconnect");
 
                             let req = Request::builder()
                                 .method("GET")
@@ -163,13 +162,13 @@ impl Stream for EventStream {
                 if let Some(idx) = buf.iter().rev().position(|byte| *byte == '\r' as u8 || *byte == '\n' as u8) {
                     let buf_len = buf.len();
                     let message_bytes = buf.split_to(buf_len - idx + 1);
-                    println!("readysome, full message. idx: {}", idx);
+                    event!(Level::DEBUG, "readysome, full message. idx: {}", idx);
                     Poll::Ready(Some(Ok(Event::Message(Message{
                         ty: "message".into(),
                         text: String::from_utf8(message_bytes.to_vec()).unwrap(),
                     }))))
                 } else {
-                    println!("readysome, not full message: {}", String::from_utf8(buf.to_vec()).unwrap());
+                    event!(Level::DEBUG, "readysome, not full message: {}", String::from_utf8(buf.to_vec()).unwrap());
                     Poll::Ready(None)
                 }
             }
