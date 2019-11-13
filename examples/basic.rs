@@ -1,4 +1,4 @@
-use evntsrc_client::{Event, EventSource};
+use evntsrc_client::EventSource;
 use futures::StreamExt;
 
 #[tokio::main]
@@ -12,14 +12,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(event) = ev.next().await {
         let event = event?;
-
-        match event {
-            Event::Message { ty, text } => {
-                println!("type: {}", ty);
-                println!("text: {}", text);
-            },
-            Event::Comment(s) => println!("comment: {}", s),
-        }
+        println!("type: {}", event.ty);
+        println!("data: {}", event.data);
+        println!("id: {}", event.id);
     };
 
     Ok(())

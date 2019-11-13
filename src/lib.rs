@@ -220,14 +220,13 @@ impl Stream for EventSource {
                 };
 
                 buf.put(chunk.into_bytes());
-
                 // note: whitespace trimmed when parsing line
-                if let Some(idx) = buf.iter().position(|byte| *byte == '\r' as u8 || *byte == '\n' as u8) {
-                    let message_bytes = buf.split_to(idx + 1);
-                    event!(Level::DEBUG, "readysome, full line. idx: {}", idx);
+                if let Some(idx) = buf.iter().rev().position(|byte| *byte == '\r' as u8 || *byte == '\n' as u8) {
+                    let message_bytes = buf.split_to(buf.len() - idx + 1);
+                    event!(Level::DEBUG, "readysome, full lines. chunk idx: {}", idx);
 
                     let s = String::from_utf8(message_bytes.to_vec())?;
-                    event!(Level::INFO, "process line: {}", s);
+                    event!(Level::INFO, "process lines: {}", s);
 
                     // fn process line
                     match s.parse::<Line>() {
